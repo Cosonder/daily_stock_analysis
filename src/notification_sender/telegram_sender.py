@@ -13,10 +13,150 @@ import time
 import re
 
 from src.config import Config
-from src.formatters import _custom_unit_to_index, strip_hidden_markdown_metadata, utf16_len
+from src.formatters import _custom_unit_to_index, strip_hidden_markdown_metadata, utf16_len, utf8_len
 
 
 logger = logging.getLogger(__name__)
+
+# https://core.telegram.org/bots/api#rich-message-limits
+# Bound the Markdown source in UTF-8 bytes, conservatively below the rendered
+# 32768-character limit, including for Chinese and emoji.
+RICH_MAX_BYTES = 32768
+RICH_MAX_BLOCKS = 500
+
+
+def _rich_block_budget(text: str) -> int:
+    """Conservative source-based bound, including nested lists/quotes and rows.
+
+    Counting two blocks per nonempty source line overcounts ordinary paragraphs
+    and table rows, leaving room for their containers. Explicit HTML tags and
+    nesting markers get additional room; the server remains authoritative.
+    """
+    return sum(
+        2 + line.count('>')
+        + (len(line) - len(line.lstrip())) // 2
+        + len(re.findall(r'<[a-zA-Z][^>]*>', line))
+        for line in text.splitlines() if line.strip()
+    )
+
+
+def _split_rich_markdown(content: str) -> list[str]:
+    """Keep paragraphs/inline formatting intact, repeat table headers and fences.
+
+    An indivisible oversized inline construct is rejected before sending any
+    chunks so that the caller can deliver it through the legacy fallback.
+    """
+    def fits(text: str) -> bool:
+        return utf8_len(text) <= RICH_MAX_BYTES and _rich_block_budget(text) <= RICH_MAX_BLOCKS
+
+    if fits(content):
+        return [content]
+    # These constructs can span distant source blocks. Let the existing
+    # delivery path handle them instead of breaking HTML or reference scopes.
+    if re.search(r'^\s*\[[^\]]+\]:\s+\S|<\s*/?[a-zA-Z][^>]*>', content, re.MULTILINE):
+        raise ValueError('long report contains scoped HTML or reference definitions')
+
+    def pack(parts: list[str], prefix: str = '', suffix: str = '') -> list[str]:
+        result = []
+        current = ''
+        for part in parts:
+            if not fits(prefix + part + suffix):
+                raise ValueError('indivisible Markdown block exceeds rich message limits')
+            if current and not fits(prefix + current + part + suffix):
+                result.append(prefix + current + suffix)
+                current = ''
+            current += part
+        if current:
+            result.append(prefix + current + suffix)
+        return result
+
+    lines = content.splitlines(keepends=True)
+    blocks = []
+    index = 0
+    while index < len(lines):
+        start = index
+        fence = re.match(r'^ {0,3}(`{3,}|~{3,})[^\n]*', lines[index])
+        if fence:
+            marker = fence.group(1)
+            index += 1
+            while index < len(lines):
+                closing = re.match(r'^ {0,3}' + re.escape(marker[0]) + r'{' + str(len(marker)) + r',}\s*$', lines[index])
+                index += 1
+                if closing:
+                    break
+            else:
+                raise ValueError('unclosed Markdown fence')
+            block = ''.join(lines[start:index])
+            if fits(block):
+                blocks.append(block)
+            else:
+                # Reopen each code chunk with its original language and fence.
+                if not fits(lines[start] + '\n' + marker + '\n'):
+                    raise ValueError('Markdown fence exceeds rich message limits')
+                body = lines[start + 1:index - 1]
+                pieces = []
+                for line in body:
+                    while utf8_len(line) > RICH_MAX_BYTES - utf8_len(lines[start] + '\n' + marker):
+                        cut = _custom_unit_to_index(line, RICH_MAX_BYTES // 2, utf8_len)
+                        pieces.append(line[:cut] + '\n')
+                        line = line[cut:]
+                    pieces.append(line)
+                blocks.extend(pack(pieces, lines[start], '\n' + marker + '\n'))
+            continue
+
+        # GFM pipe table: split only between rows, retaining a complete header.
+        if index + 1 < len(lines) and '|' in lines[index] and re.fullmatch(
+            r'\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)+\|?\s*', lines[index + 1]
+        ):
+            index += 2
+            while index < len(lines) and lines[index].strip() and '|' in lines[index]:
+                index += 1
+            block = ''.join(lines[start:index])
+            if fits(block):
+                blocks.append(block)
+            else:
+                blocks.extend(pack(lines[start + 2:index], ''.join(lines[start:start + 2])))
+            continue
+
+        index += 1
+        while index < len(lines) and lines[index].strip() and not re.match(
+            r'^\s*(?:#{1,6}\s|`{3,}|~{3,}|\|)', lines[index]
+        ):
+            index += 1
+        block = ''.join(lines[start:index])
+        if fits(block):
+            blocks.append(block)
+            continue
+        # Protect complete inline constructs. Plain words can be cut at Unicode
+        # boundaries; an oversized link/code/emphasis goes to legacy delivery.
+        inline = (
+            r'(`+)[\s\S]*?\1|\[[^\]]*\]\((?:[^()]|\([^()]*\))*\)|'
+            r'\*\*[\s\S]*?\*\*|__[\s\S]*?__|\*[^*]+\*|_[^_]+_|~~[\s\S]*?~~'
+        )
+        tokens = []
+        pos = 0
+        for match in re.finditer(inline, block):
+            tokens.extend(block[pos:match.start()])
+            tokens.append(match.group())
+            pos = match.end()
+        tokens.extend(block[pos:])
+        # Aggregate characters before pack() to avoid repeatedly measuring a
+        # whole growing paragraph for every character.
+        fragments = []
+        current = ''
+        current_bytes = 0
+        for token in tokens:
+            token_bytes = utf8_len(token)
+            if current and (current_bytes + token_bytes > 8192 or token == '\n'):
+                fragments.append(current)
+                current = ''
+                current_bytes = 0
+            current += token
+            current_bytes += token_bytes
+        if current:
+            fragments.append(current)
+        blocks.extend(pack(fragments))
+    return pack(blocks)
 
 
 class TelegramSender:
@@ -49,13 +189,8 @@ class TelegramSender:
         """
         推送消息到 Telegram 机器人
 
-        Telegram Bot API 格式：
-        POST https://api.telegram.org/bot<token>/sendMessage
-        {
-            "chat_id": "xxx",
-            "text": "消息内容",
-            "parse_mode": "Markdown"
-        }
+        优先以原始 Markdown 调用 sendRichMessage；逐块失败后回退旧版
+        sendMessage，Markdown 解析失败时最后回退纯文本。
 
         Args:
             content: 消息内容（Markdown 格式）
@@ -90,33 +225,87 @@ class TelegramSender:
                 logger.warning("Telegram 消息内容为空，跳过推送")
                 return False
 
-            telegram_content = self._convert_to_telegram_markdown(sanitized_content)
-
-            if utf16_len(telegram_content) <= max_length:
-                # 单条消息发送
-                return self._send_telegram_message(
-                    api_url,
-                    chat_id,
-                    sanitized_content,
-                    message_thread_id,
-                    timeout_seconds=timeout_seconds,
-                )
+            try:
+                chunks = _split_rich_markdown(sanitized_content)
+            except ValueError as exc:
+                logger.error("Telegram 富文本分段失败，回退 sendMessage: %s", exc)
+                chunks = [sanitized_content]
+                rich_enabled = False
             else:
-                # 按 Markdown 转义后的最终 payload 分段，避免转义字符使请求超限
-                return self._send_telegram_chunked(
-                    api_url,
-                    chat_id,
-                    telegram_content,
-                    max_length,
-                    message_thread_id,
+                rich_enabled = True
+
+            all_success = True
+            for chunk in chunks:
+                if rich_enabled and self._send_rich_message(
+                    api_url.replace('/sendMessage', '/sendRichMessage'),
+                    chat_id, chunk, message_thread_id, timeout_seconds=timeout_seconds,
+                ):
+                    continue
+                # Only retry the failed chunk, never resend rich chunks already
+                # delivered. Stop probing an unavailable rich API for this report.
+                rich_enabled = False
+                if not self._send_legacy_report(
+                    api_url, chat_id, chunk, max_length, message_thread_id,
                     timeout_seconds=timeout_seconds,
-                )
+                ):
+                    all_success = False
+            return all_success
 
         except Exception as e:
             logger.error(f"发送 Telegram 消息失败: {e}")
             import traceback
             logger.debug(traceback.format_exc())
             return False
+
+    def _send_rich_message(
+        self, api_url: str, chat_id: str, text: str,
+        message_thread_id: Optional[str] = None, *,
+        timeout_seconds: Optional[float] = None,
+    ) -> bool:
+        payload = {'chat_id': chat_id, 'rich_message': {'markdown': text}}
+        if message_thread_id:
+            payload['message_thread_id'] = message_thread_id
+        try:
+            response = requests.post(api_url, json=payload, timeout=timeout_seconds or 10)
+            result = response.json()
+            if not isinstance(result, dict):
+                raise ValueError('Telegram response is not an object')
+            if response.status_code == 200 and result.get('ok'):
+                logger.info('Telegram 富文本消息发送成功')
+                return True
+            logger.error('Telegram sendRichMessage 失败: HTTP %s, %s；回退 sendMessage',
+                         response.status_code, result.get('description', '未知错误'))
+        except (requests.RequestException, ValueError) as exc:
+            # Do not log request exceptions: their URLs may contain the bot token.
+            logger.error('Telegram sendRichMessage 异常: %s；回退 sendMessage', type(exc).__name__)
+        return False
+
+    def _send_legacy_report(
+        self, api_url: str, chat_id: str, sanitized_content: str, max_length: int,
+        message_thread_id: Optional[str] = None, *,
+        timeout_seconds: Optional[float] = None,
+    ) -> bool:
+        telegram_content = self._convert_to_telegram_markdown(sanitized_content)
+
+        if utf16_len(telegram_content) <= max_length:
+            # 单条消息发送
+            return self._send_telegram_message(
+                api_url,
+                chat_id,
+                sanitized_content,
+                message_thread_id,
+                timeout_seconds=timeout_seconds,
+            )
+        else:
+            # 按 Markdown 转义后的最终 payload 分段，避免转义字符使请求超限
+            return self._send_telegram_chunked(
+                api_url,
+                chat_id,
+                telegram_content,
+                max_length,
+                message_thread_id,
+                timeout_seconds=timeout_seconds,
+            )
 
     def _send_telegram_message(
         self,
@@ -307,8 +496,7 @@ class TelegramSender:
         for section in sections:
             if utf16_len(section) > max_length:
                 # 单段超限时强制切片，避免依赖“\\n---\\n”边界导致的整段超长发送
-                if not _flush_chunk():
-                    return False
+                _flush_chunk()
                 for long_chunk in _split_long_section(section, max_length):
                     logger.info(f"发送 Telegram 消息块 {chunk_index}...")
                     chunk_index += 1
@@ -337,9 +525,7 @@ class TelegramSender:
             current_length += additional_length
 
         # 发送最后一块
-        if not _flush_chunk():
-            return False
-
+        _flush_chunk()
         return all_success
 
     def _send_telegram_photo(self, image_bytes: bytes) -> bool:

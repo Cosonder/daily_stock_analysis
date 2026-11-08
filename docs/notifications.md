@@ -43,10 +43,20 @@ Discord 长报告发送复用现有分片链路：单条 `content` 运行时不�
 
 当前默认推送报告的入口、内容来源和整体版式保持不变。本阶段只收敛通知渲染的技术路线：沉淀渠道能力画像、发送前消息结构和结构感知分片能力，避免后续按渠道扩展时继续在各 sender 中堆叠平行逻辑。
 
-默认发送路径沿用既有 sender 行为，不接入新增 renderer：飞书和 Telegram 继续使用原有兼容转换，企业微信、Slack 继续使用原有分片逻辑，避免改变线上可见报告版式。新增的渠道能力画像、PreparedMessage、renderer preset 和结构感知分片仅作为后续扩展基础；如需启用企业微信、飞书、Telegram、Slack 等渠道专用 renderer，应通过显式配置、真实发送验证和回归测试逐步接入。
+默认发送路径不接入新增 renderer：飞书继续使用原有兼容转换，企业微信、Slack 继续使用原有分片逻辑。Telegram 的独立 sender 优先直接发送原始 Markdown，详见下节。新增的渠道能力画像、PreparedMessage 和 renderer preset 仍作为后续扩展基础。
+
+### Telegram 富文本报告
+
+Telegram 优先调用 [sendRichMessage](https://core.telegram.org/bots/api#sendrichmessage)，请求体使用 `rich_message={"markdown": 报告正文}`，不执行旧版 Markdown 转换，保留标题、粗体、链接、表格与中文；仍会清除内部隐藏元数据。Chat ID、Topic ID、调用方超时和原有 Secrets 均沿用现有设置，无需新增配置。
+
+[官方限制](https://core.telegram.org/bots/api#rich-message-limits)为最多 32768 个 UTF-8 字符、500 个块（包括嵌套块、列表项和表格行）。发送器保守地限制 Markdown 源码为 32768 UTF-8 **字节**，并按非空行、嵌套标记和 HTML 标签估算块数上界，因此中文报告可能提前分段。优先保持段落与行内格式完整；大表格在行间切分并重复表头，代码块切分时闭合并重新打开围栏。无法安全切分的超大链接等整体转入旧版发送路径，不截断正文。
+
+富文本 API 返回错误、非 JSON 响应或发生网络异常时记录错误，对当前未成功块回退 `sendMessage` + `parse_mode=Markdown`，之后的块也使用旧版路径；Markdown 解析失败时最后尝试纯文本。已成功发送的富文本块不会重新发送。旧版路径仍按转换后的 UTF-16 长度限制为 4096，保留原有有限重试。网络超时后的回退无法排除服务端已接收请求造成的重复，这是 Telegram 无幂等键时的限制。
+
+验证：`python -m pytest tests/test_telegram_rich_message.py tests/test_notification_sender.py tests/test_notification.py tests/test_formatters.py -q`，测试使用模拟 API，不需要 Telegram Secrets。创建面向 `main` 的 PR 后，现有 CI 会自动运行 `backend-tests (1/3)` 至 `(3/3)` 并汇总到 `backend-gate`。真实投递可在合入后从 Actions 手动运行现有每日分析工作流，检查日志中的“Telegram 富文本消息发送成功”，并在 Telegram 中检查标题、粗体、链接、表格及 Topic；此步骤沿用现有 Secrets，不需要修改其他通知配置。
 
 兼容性排除说明：
-- 本轮未改动 `src/notification_sender/wechat_sender.py`、`src/notification_sender/slack_sender.py`、`src/notification_sender/telegram_sender.py` 的发送路径；`src/notification_sender/feishu_sender.py` 新增 `send_feishu_file()` 文件发送路径，Webhook 模式回退为发送文件内容文本，App Bot 文字发送路径（`send_to_feishu` → `_send_via_app_bot`）保持不变。
+- 企业微信、Slack 的发送路径保持不变；Telegram 使用上述富文本优先与兼容回退路径。`src/notification_sender/feishu_sender.py` 的 `send_feishu_file()` 文件发送路径在 Webhook 模式回退为发送文件内容文本，App Bot 文字发送路径（`send_to_feishu` → `_send_via_app_bot`）保持不变。
 - `model_used` 只在报告渲染末尾展示，不参与 provider/model/base_url 的 runtime 选择、保存、清理或迁移。若某次 CI 扫描到“provider/API 兼容迁移”类关键词，命中范围应优先回归到测试夹具中的 `model_used` 示例与报告快照 fixture（`tests/fixtures/notification_reports/*.md`），以及 `src/notification.py` 对 `report_show_llm_model` 的仅展示开关逻辑。
 - `REPORT_SHOW_LLM_MODEL` 与 `report_renderer_enabled` 均为展示/降级策略开关：关闭仅影响报告可见结构，不会触发配置迁移或运行时参数回退；回退方式为恢复 `true`（或移除该项）或恢复默认配置。
 

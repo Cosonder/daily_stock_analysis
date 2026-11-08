@@ -1189,6 +1189,8 @@ FEISHU_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/your_hook_token
 更完整的图文排查请看 [docs/bot/feishu-bot-config.md](bot/feishu-bot-config.md)。
 ### Telegram
 
+报告优先使用 `sendRichMessage` 直接发送原始 Markdown；长报告按长度与块数限制分段，失败后回退旧版 Markdown，再在解析失败时尝试纯文本。Chat ID、Topic ID、超时和 GitHub Secrets 无需调整。详见[富文本限制与 Actions 验证](notifications.md#telegram-富文本报告)。
+
 1. 与 @BotFather 对话创建 Bot
 2. 获取 Bot Token
 3. 获取 Chat ID（可通过 @userinfobot）
