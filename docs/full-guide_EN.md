@@ -1058,6 +1058,8 @@ For a full illustrated troubleshooting guide, see [docs/bot/feishu-bot-config.md
 4. Set `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`
 5. (Optional) To send to Topic, set `TELEGRAM_MESSAGE_THREAD_ID` (get from Topic link)
 
+Reports use `sendRichMessage` with the original Markdown (headings, bold, links and tables). Long reports are split conservatively at 32768 UTF-8 source bytes and 500 estimated blocks, repeating table headers and reopening code fences. Rich API failures fall back to the existing `sendMessage` Markdown path, then plain text on Markdown parsing errors. Existing Chat/Topic IDs, timeouts and GitHub Secrets are unchanged. See [notification delivery and Actions verification](notifications.md#telegram-富文本报告) for limits and verification steps; offline tests need no Telegram credentials.
+
 ### Email
 
 1. Enable SMTP service for your email
